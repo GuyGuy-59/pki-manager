@@ -1,0 +1,74 @@
+#!/bin/bash
+#
+# PKI Manager - Main entry point
+# Wrapper script to call PKI Manager commands
+#
+# Usage: ./pki <command> [options]
+#   Commands:
+#     ca    - Certificate Authority management
+#     cert  - Certificate generation
+#     crl   - Certificate Revocation List management
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+BIN_DIR="${SCRIPT_DIR}/bin"
+
+if [ $# -eq 0 ]; then
+    cat >&2 <<EOF
+PKI Manager - Public Key Infrastructure Management Tool
+
+Usage: $0 <command> [options]
+
+Commands:
+  ca      Certificate Authority management
+  cert    Certificate generation
+  crl     Certificate Revocation List management
+
+For help on a specific command:
+  $0 <command> --help
+
+Examples:
+  $0 ca create -p myproject -a ec
+  $0 cert -p myproject -t server -a ec -n "example.com"
+  $0 crl -p myproject -r 01 -u
+
+EOF
+    exit 1
+fi
+
+COMMAND="$1"
+shift
+
+case "$COMMAND" in
+    ca)
+        exec "${BIN_DIR}/pki-ca" "$@"
+        ;;
+    cert)
+        exec "${BIN_DIR}/pki-cert" "$@"
+        ;;
+    crl)
+        exec "${BIN_DIR}/pki-crl" "$@"
+        ;;
+    --help|-h|help)
+        cat >&2 <<EOF
+PKI Manager - Public Key Infrastructure Management Tool
+
+Usage: $0 <command> [options]
+
+Commands:
+  ca      Certificate Authority management
+  cert    Certificate generation
+  crl     Certificate Revocation List management
+
+For help on a specific command:
+  $0 <command> --help
+
+EOF
+        exit 0
+        ;;
+    *)
+        echo "Unknown command: $COMMAND" >&2
+        echo "Use '$0 --help' for usage information" >&2
+        exit 1
+        ;;
+esac
+

@@ -1,0 +1,259 @@
+#!/bin/bash
+#
+# PKI Manager - Certificate Revocation List Management
+# Revokes certificates and manages Certificate Revocation Lists (CRL)
+#
+# Usage: pki-crl -p <project_name> [-r <serial>] [-u]
+#   -p: Project name (required)
+#   -r: Serial number of certificate to revoke (optional)
+#   -u: Force CRL update (optional)
+#
+# Examples:
+#   pki-crl -p demo -r 01 -u    # Revoke and update CRL
+#   pki-crl -p demo -u          # Update CRL only
+
+set -uo pipefail
+
+# Get script directory and source common library
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+PROJECT_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
+source "${PROJECT_ROOT}/lib/common.sh"
+
+# Display usage
+usage() {
+    cat >&2 <<EOF
+Usage: $0 -p <project_name> [-r <serial>] [-u]
+
+Options:
+  -p <project_name>  Project name (must match existing CA project)
+  -r <serial>        Serial number of certificate to revoke (hex format, e.g., 01, 0A)
+  -u                 Force CRL update even if no certificate is being revoked
+  -h                 Show this help message
+
+Examples:
+  # Revoke a certificate with serial number 01
+  $0 -p demo -r 01
+
+  # Update CRL without revoking any certificate
+  $0 -p demo -u
+
+  # Revoke and update CRL
+  $0 -p demo -r 02 -u
+
+EOF
+    exit 1
+}
+
+# Parse command line arguments
+parse_args() {
+    local project_name=""
+    local revoke_serial=""
+    local update_crl=""
+    
+    while getopts p:r:uh opt; do
+        case "$opt" in
+            p)
+                project_name="$OPTARG"
+                ;;
+            r)
+                revoke_serial="$OPTARG"
+                ;;
+            u)
+                update_crl="true"
+                ;;
+            h)
+                usage
+                ;;
+            *)
+                usage
+                ;;
+        esac
+    done
+    
+    if [ -z "$project_name" ]; then
+        usage
+    fi
+    
+    echo "${project_name}|${revoke_serial}|${update_crl}"
+}
+
+# normalize_serial is now in lib/common.sh
+
+# Find certificate file by serial number
+find_certificate_file() {
+    local project_dir="$1"
+    local revoke_serial="$2"
+    local serial_norm
+    local cert_file=""
+    
+    serial_norm=$(normalize_serial "$revoke_serial")
+    
+    # First, try to find in newcerts directory (format: serial.pem)
+    if [ -f "${project_dir}/newcerts/${revoke_serial}.pem" ]; then
+        cert_file="${project_dir}/newcerts/${revoke_serial}.pem"
+    elif [ -f "${project_dir}/newcerts/${serial_norm}.pem" ]; then
+        cert_file="${project_dir}/newcerts/${serial_norm}.pem"
+    else
+        # Try to find by searching in newcerts with different formats
+        local f
+        for f in "${project_dir}"/newcerts/*.pem; do
+            if [ -f "$f" ]; then
+                local file_serial
+                file_serial=$(openssl x509 -in "$f" -noout -serial 2>/dev/null | cut -d= -f2 | sed 's/^0*//' | tr '[:lower:]' '[:upper:]')
+                if [ "$file_serial" = "$serial_norm" ]; then
+                    cert_file="$f"
+                    break
+                fi
+            fi
+        done
+    fi
+    
+    # If still not found, try to find in current directory
+    if [ -z "$cert_file" ] || [ ! -f "$cert_file" ]; then
+        local f
+        for f in "${project_dir}"/*.crt; do
+            if [ -f "$f" ]; then
+                local file_serial
+                file_serial=$(openssl x509 -in "$f" -noout -serial 2>/dev/null | cut -d= -f2 | sed 's/^0*//' | tr '[:lower:]' '[:upper:]')
+                if [ "$file_serial" = "$serial_norm" ]; then
+                    cert_file="$f"
+                    break
+                fi
+            fi
+        done
+    fi
+    
+    echo "$cert_file"
+}
+
+# Revoke certificate
+revoke_certificate() {
+    local project_dir="$1"
+    local revoke_serial="$2"
+    local cert_file
+    
+    echo "Revoking certificate with serial number: $revoke_serial"
+    
+    cert_file=$(find_certificate_file "$project_dir" "$revoke_serial")
+    
+    if [ -z "$cert_file" ] || [ ! -f "$cert_file" ]; then
+        error_exit "Certificate file not found for serial $revoke_serial
+
+Please ensure the certificate exists in newcerts/ directory or provide the certificate file path.
+You can find certificates by serial number using:
+  openssl x509 -in <cert_file> -noout -serial"
+    fi
+    
+    echo "Found certificate file: $cert_file"
+    
+    # Attempt to revoke the certificate
+    local revoke_output
+    local revoke_status
+    
+    revoke_output=$(openssl ca -revoke "$cert_file" \
+        -config "${project_dir}/ca.cnf" \
+        -keyfile "${project_dir}/ca.key" \
+        -cert "${project_dir}/ca.crt" \
+        -passin "file:${project_dir}/ca.pass" 2>&1) || revoke_status=$?
+    
+    revoke_status=${revoke_status:-0}
+    
+    if [ $revoke_status -eq 0 ]; then
+        info "Certificate $revoke_serial has been revoked."
+        return 0
+    elif echo "$revoke_output" | grep -qi "already revoked"; then
+        warning "Certificate $revoke_serial is already revoked."
+        return 0  # Continue to update CRL even if already revoked
+    else
+        error_exit "Failed to revoke certificate
+
+$revoke_output"
+    fi
+}
+
+# Update CRL
+update_crl() {
+    local project_dir="$1"
+    local crl_file="${project_dir}/crl/ca.crl"
+    
+    echo "Updating Certificate Revocation List..."
+    
+    # Ensure CRL file is writable (it may have been created with read-only permissions)
+    if [ -f "$crl_file" ]; then
+        chmod 644 "$crl_file"
+    fi
+    
+    # Generate new CRL
+    openssl ca -gencrl \
+        -config "${project_dir}/ca.cnf" \
+        -keyfile "${project_dir}/ca.key" \
+        -cert "${project_dir}/ca.crt" \
+        -passin "file:${project_dir}/ca.pass" \
+        -out "$crl_file"
+    
+    # Set read-only permissions
+    chmod 444 "$crl_file"
+    
+    # Display CRL information
+    echo
+    success "CRL has been updated:"
+    echo " - CRL file: '${crl_file}'"
+    echo
+    echo "Show CRL details via:"
+    echo "    openssl crl -in ${crl_file} -text -noout"
+    echo
+    
+    # Count revoked certificates
+    local revoked_count
+    revoked_count=$(openssl crl -in "$crl_file" -text -noout 2>/dev/null | grep -c "Serial Number:" || echo "0")
+    echo "Number of revoked certificates: $revoked_count"
+}
+
+# Validate project directory and files
+validate_project() {
+    local project_dir="$1"
+    
+    # Use validate_project_dir from common library
+    validate_project_dir "$project_dir"
+}
+
+# Main function
+main() {
+    local project_name revoke_serial update_crl
+    local result
+    
+    # Set locale
+    export LC_CTYPE=C
+    
+    # Check dependencies
+    check_dependencies
+    
+    # Parse arguments
+    result=$(parse_args "$@")
+    project_name=$(echo "$result" | cut -d'|' -f1)
+    revoke_serial=$(echo "$result" | cut -d'|' -f2)
+    update_crl=$(echo "$result" | cut -d'|' -f3)
+    
+    # Get absolute path to project directory
+    local project_dir
+    project_dir=$(cd "$project_name" && pwd)
+    
+    # Validate project
+    validate_project "$project_dir"
+    
+    # Revoke certificate if serial number provided
+    if [ -n "$revoke_serial" ]; then
+        revoke_certificate "$project_dir" "$revoke_serial"
+    fi
+    
+    # Update CRL if certificate was revoked or -u flag was provided
+    if [ -n "$revoke_serial" ] || [ -n "$update_crl" ]; then
+        update_crl "$project_dir"
+    elif [ -z "$revoke_serial" ] && [ -z "$update_crl" ]; then
+        warning "No action specified. Use -r to revoke a certificate or -u to update CRL."
+        usage
+    fi
+}
+
+# Run main function
+main "$@"

@@ -1,0 +1,468 @@
+#!/bin/bash
+#
+# PKI Manager - Certificate Generation
+# Generates server (X.509) or client (PKCS#12) certificates
+#
+# Usage: pki-cert -p <project> -t <type> -a <algorithm> [-n <name>] [-c <cnf_file>]
+#   -p: Project name (required)
+#   -t: Certificate type - 'server' or 'client' (required)
+#   -a: Algorithm - 'rsa' or 'ec' (required)
+#   -n: Common Name (optional)
+#   -c: Custom OpenSSL configuration file (optional)
+#
+# Environment variables:
+#   CRT_C, CRT_L, CRT_O, CRT_OU, CRT_CN: Certificate subject fields
+#   CRT_EXPIRE_DAYS: Certificate validity period (default: 365)
+#   CRT_SAN: Subject Alternative Names (comma-separated)
+#   CA_ISCUSTOM: Use custom CA (default: true)
+
+set -uo pipefail
+
+# Get script directory and source common library
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+PROJECT_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
+source "${PROJECT_ROOT}/lib/common.sh"
+
+# Cleanup function for temporary files
+cleanup() {
+    local tmp_file="${1:-}"
+    if [ -n "$tmp_file" ] && [ -f "$tmp_file" ]; then
+        rm -f "$tmp_file"
+    fi
+}
+
+# Display usage
+usage() {
+    cat >&2 <<EOF
+Usage: $0 -p <project_name> -t <type> -a <algorithm> [-n <name>] [-c <cnf_file>]
+
+Options:
+  -p <project_name>  Project name (must match existing CA project)
+  -t <type>          Certificate type: 'server' or 'client' (required)
+  -a <algorithm>    Algorithm: 'rsa' or 'ec' (required)
+  -n <name>          Common Name (CN) for the certificate (optional)
+  -c <cnf_file>      Custom OpenSSL configuration file (optional)
+  -h                 Show this help message
+
+Environment variables:
+  CRT_C             Country code (default: FR)
+  CRT_L             Locality (default: Paris)
+  CRT_O             Organization (default: France)
+  CRT_OU            Organizational Unit (default: DevOps)
+  CRT_CN            Common Name (can be overridden by -n)
+  CRT_EXPIRE_DAYS   Certificate validity in days (default: 365)
+  CRT_SAN            Subject Alternative Names (e.g., DNS:example.com,DNS:www.example.com,IP:192.168.1.1)
+  CA_ISCUSTOM        Use custom CA (default: true)
+
+Examples:
+  $0 -p demo -t server -a ec -n "api.example.com"
+  $0 -p demo -t client -a ec -n "John Doe"
+  $0 -p demo -t server -a ec -n "example.com" -c example_cert.cnf
+
+EOF
+    exit 1
+}
+
+# Parse command line arguments
+parse_args() {
+    local project_name=""
+    local cert_type=""
+    local algo_key=""
+    local cert_cn=""
+    local cnf_file=""
+    
+    while getopts p:t:a:n:c:h opt; do
+        case "$opt" in
+            p)
+                project_name="$OPTARG"
+                ;;
+            t)
+                case "$OPTARG" in
+                    client|server)
+                        cert_type="$OPTARG"
+                        ;;
+                    *)
+                        error_exit "Invalid certificate type '$OPTARG'. Must be 'client' or 'server'"
+                        ;;
+                esac
+                ;;
+            a)
+                case "$OPTARG" in
+                    rsa|ec)
+                        algo_key="$OPTARG"
+                        ;;
+                    *)
+                        error_exit "Invalid algorithm '$OPTARG'. Must be 'rsa' or 'ec'"
+                        ;;
+                esac
+                ;;
+            n)
+                cert_cn="$OPTARG"
+                ;;
+            c)
+                cnf_file="$OPTARG"
+                ;;
+            h)
+                usage
+                ;;
+            *)
+                usage
+                ;;
+        esac
+    done
+    
+    if [ -z "$project_name" ] || [ -z "$cert_type" ] || [ -z "$algo_key" ]; then
+        usage
+    fi
+    
+    echo "${project_name}|${cert_type}|${algo_key}|${cert_cn}|${cnf_file}"
+}
+
+# generate_password is now in lib/common.sh
+
+# Build certificate subject
+build_certificate_subject() {
+    local cert_cn="${1:-}"
+    local default_cn="${2:-default}"
+    
+    local country="${CRT_C:-FR}"
+    local locality="${CRT_L:-Paris}"
+    local org="${CRT_O:-France}"
+    local org_unit="${CRT_OU:-DevOps}"
+    local cn="${cert_cn:-${CRT_CN:-$default_cn}}"
+    
+    echo "/C=${country}/L=${locality}/O=${org}/OU=${org_unit}/CN=${cn}"
+}
+
+# Extract CN from subject
+extract_cn_from_subject() {
+    local subject="$1"
+    echo "$subject" | sed -e 's,.*CN=\([^/]*\).*,\1,'
+}
+
+# Build extension file content
+build_extension_content() {
+    local cert_type="$1"
+    local san="${CRT_SAN:-}"
+    
+    local content="extendedKeyUsage = ${cert_type}Auth"
+    
+    if [ -n "$san" ]; then
+        content="${content}\nsubjectAltName = ${san}"
+    fi
+    
+    echo -e "$content"
+}
+
+# Create temporary extension file
+create_temp_extfile() {
+    local content="$1"
+    local project_dir="$2"
+    local tmp_file="${project_dir}/tmp_ext_$$_$(date +%s).cnf"
+    
+    echo -e "$content" > "$tmp_file"
+    chmod 644 "$tmp_file"
+    
+    echo "$tmp_file"
+}
+
+# Find extension section in CNF file
+find_extension_section() {
+    local cnf_file="$1"
+    local cert_type="$2"
+    
+    if grep -q "\[ v3_${cert_type} \]" "$cnf_file" 2>/dev/null; then
+        echo "v3_${cert_type}"
+    elif grep -q "\[ v3_req \]" "$cnf_file" 2>/dev/null; then
+        echo "v3_req"
+    else
+        echo ""
+    fi
+}
+
+# Generate certificate signing request
+generate_csr() {
+    local cert_uid="$1"
+    local algo="$2"
+    local subject="$3"
+    local no_passwd="$4"
+    local pass_file="${cert_uid}.key.pass"
+    
+    local passwd_string
+    if [ "$no_passwd" = "true" ]; then
+        passwd_string="-nodes"
+    else
+        generate_password 30 > "$pass_file"
+        passwd_string="-passout file:${pass_file}"
+    fi
+    
+    if [ "$algo" = "ec" ]; then
+        openssl req \
+            -new \
+            -newkey ec:<(openssl ecparam -name secp384r1) \
+            -keyout "${cert_uid}.key" \
+            $passwd_string \
+            -utf8 -nameopt multiline,utf8 \
+            -out "${cert_uid}.csr" \
+            -subj "$subject"
+    elif [ "$algo" = "rsa" ]; then
+        openssl req \
+            -new \
+            -newkey rsa:4096 \
+            -keyout "${cert_uid}.key" \
+            $passwd_string \
+            -utf8 -nameopt multiline,utf8 \
+            -out "${cert_uid}.csr" \
+            -subj "$subject"
+    else
+        error_exit "Unsupported algorithm: $algo"
+    fi
+}
+
+# Sign certificate using openssl ca
+sign_certificate_ca() {
+    local cert_uid="$1"
+    local project_dir="$2"
+    local expire_days="${3:-${CRT_EXPIRE_DAYS:-365}}"
+    local extfile="${4:-}"
+    
+    # Use relative paths since we're already in project_dir
+    local ca_cmd=(
+        openssl ca -batch
+        -config "ca.cnf"
+        -days "$expire_days"
+        -md sha512
+        -in "${cert_uid}.csr"
+        -passin "file:ca.pass"
+        -out "${cert_uid}.crt"
+    )
+    
+    if [ -n "$extfile" ]; then
+        ca_cmd+=(-extfile "$extfile")
+    fi
+    
+    "${ca_cmd[@]}"
+}
+
+# Sign certificate using openssl x509
+sign_certificate_x509() {
+    local cert_uid="$1"
+    local project_dir="$2"
+    local expire_days="${3:-${CRT_EXPIRE_DAYS:-365}}"
+    local cnf_file="$4"
+    local ext_section="${5:-}"
+    
+    # Use relative paths since we're already in project_dir
+    local x509_cmd=(
+        openssl x509 -req
+        -days "$expire_days"
+        -sha512
+        -in "${cert_uid}.csr"
+        -passin "file:ca.pass"
+        -CA "ca.crt"
+        -CAkey "ca.key"
+        -CAserial "ca.srl"
+        -CAcreateserial
+        -out "${cert_uid}.crt"
+        -extfile "$cnf_file"
+    )
+    
+    if [ -n "$ext_section" ]; then
+        x509_cmd+=(-extensions "$ext_section")
+    fi
+    
+    "${x509_cmd[@]}"
+}
+
+# Generate PKCS#12 file for client certificates
+generate_pkcs12() {
+    local cert_uid="$1"
+    local cert_cn="$2"
+    
+    local p12_pass_file="${cert_uid}.p12.pass"
+    generate_password 15 > "$p12_pass_file"
+    
+    openssl pkcs12 -export \
+        -passin "file:${cert_uid}.key.pass" \
+        -inkey "${cert_uid}.key" \
+        -in "${cert_uid}.crt" \
+        -name "$cert_cn" \
+        -passout "file:${p12_pass_file}" \
+        -out "${cert_uid}.p12"
+}
+
+# Display server certificate information
+display_server_cert_info() {
+    local cert_uid="$1"
+    local cert_cn="$2"
+    local project_dir="$3"
+    
+    cat <<EOF
+
+$(tput bold)
+The X509 file has been generated for server identified as '${cert_cn}'
+
+  pubcert.crt : ${project_dir}/${cert_uid}.crt
+
+You can now install it on your server so the clients can identify your server.
+
+NB1:
+This server certificate is verified on the client side when the browser finds the CA used to generate this certificate in its list of *trusted* CA,
+which means the CA certificate have to be deployed on the client in order to perform such verification (otherwise the identity will be reported as *untrusted*)
+If you want your clients to be able to actually *trust* the provided identity (that famous 'green address bar' in a browser for example), you'll need to deploy the CA certificate on the client side
+
+  pubcert_CA.crt : ${project_dir}/ca.crt
+$(tput sgr0)
+EOF
+}
+
+# Display client certificate information
+display_client_cert_info() {
+    local cert_uid="$1"
+    local cert_cn="$2"
+    local project_dir="$3"
+    
+    cat <<EOF
+
+$(tput bold)
+The PKCS12 file has been generated for user identified as '${cert_cn}'
+(it is password protected, and contains the public certificate with the associated --also password protected-- private key)
+
+  container.p12       : ${project_dir}/${cert_uid}.p12 # <-- password stored in ${project_dir}/${cert_uid}.p12.pass
+    |
+    |-- pubcert.crt   : ${project_dir}/${cert_uid}.crt
+    \`-- privkey.key   : ${project_dir}/${cert_uid}.key # <-- password stored in ${project_dir}/${cert_uid}.key.pass
+
+You can now install it on your browser so the servers can identify yourself.
+
+NB1:
+This client certificate is verified on the server side when the application finds the CA used to generate this certificate in its list of *trusted* CA,
+which means the CA certificate have to be deployed on the server in order to perform such verification (otherwise the identity will be reported as *untrusted*)
+If you want your server to be able to actually *trust* the provided identity (successful authentication), you'll need to deploy the CA certificate on the server side
+
+NB2:
+If the end user is using Windows, you might want to rename the file .p12 -> .pfx
+$(tput sgr0)
+EOF
+}
+
+# Main function
+main() {
+    local project_name cert_type algo_key cert_cn cnf_file
+    local result
+    
+    # Set locale
+    export LC_CTYPE=C
+    
+    # Check dependencies
+    check_dependencies
+    
+    # Parse arguments
+    result=$(parse_args "$@")
+    project_name=$(echo "$result" | cut -d'|' -f1)
+    cert_type=$(echo "$result" | cut -d'|' -f2)
+    algo_key=$(echo "$result" | cut -d'|' -f3)
+    cert_cn=$(echo "$result" | cut -d'|' -f4)
+    cnf_file=$(echo "$result" | cut -d'|' -f5)
+    
+    # Validate project directory
+    local project_dir
+    project_dir=$(cd "$project_name" && pwd)
+    
+    # Use validate_project_dir from common library
+    validate_project_dir "$project_dir"
+    
+    # Ensure ca.srl exists
+    if [ ! -f "${project_dir}/ca.srl" ]; then
+        echo "01" > "${project_dir}/ca.srl"
+    fi
+    
+    # Validate CNF file if provided and convert to absolute path
+    if [ -n "$cnf_file" ]; then
+        if [ ! -f "$cnf_file" ]; then
+            error_exit "Configuration file '$cnf_file' not found"
+        fi
+        # Convert to absolute path before changing directory
+        if [[ "$cnf_file" != /* ]]; then
+            cnf_file=$(cd "$(dirname "$cnf_file")" && pwd)/$(basename "$cnf_file")
+        fi
+        echo "Using configuration file: $cnf_file"
+    fi
+    
+    # Determine password requirement
+    local no_passwd
+    if [ "$cert_type" = "server" ]; then
+        no_passwd="${NO_PASSWD:-true}"
+    else
+        no_passwd="${NO_PASSWD:-false}"
+    fi
+    
+    # Build certificate subject
+    local subject
+    subject=$(build_certificate_subject "$cert_cn" "default")
+    cert_cn=$(extract_cn_from_subject "$subject")
+    
+    # Generate certificate UID
+    local cert_uid="${cert_type}Certificate_$(date +%Y%m%d_%H%M%S)_$(echo "$cert_cn" | tr -dc A-Za-z0-9)"
+    
+    # Set secure umask for password files
+    umask 377
+    
+    # Generate CSR
+    cd "$project_dir"
+    generate_csr "$cert_uid" "$algo_key" "$subject" "$no_passwd"
+    
+    # Sign certificate
+    if [ "${CA_ISCUSTOM:-true}" = "true" ]; then
+        local extfile_tmp=""
+        local use_cnf_file=""
+        local ext_section=""
+        
+        if [ -n "$cnf_file" ]; then
+            use_cnf_file="$cnf_file"
+            ext_section=$(find_extension_section "$cnf_file" "$cert_type")
+        else
+            local ext_content
+            ext_content=$(build_extension_content "$cert_type")
+            extfile_tmp=$(create_temp_extfile "$ext_content" "$project_dir")
+        fi
+        
+        # Sign certificate
+        if [ -f "${project_dir}/ca.cnf" ] && [ -z "$use_cnf_file" ]; then
+            sign_certificate_ca "$cert_uid" "$project_dir" "${CRT_EXPIRE_DAYS:-365}" "$extfile_tmp"
+        elif [ -n "$use_cnf_file" ]; then
+            sign_certificate_x509 "$cert_uid" "$project_dir" "${CRT_EXPIRE_DAYS:-365}" "$use_cnf_file" "$ext_section"
+        else
+            sign_certificate_x509 "$cert_uid" "$project_dir" "${CRT_EXPIRE_DAYS:-365}" "$extfile_tmp" ""
+        fi
+        
+        # Cleanup temporary file
+        if [ -n "$extfile_tmp" ]; then
+            cleanup "$extfile_tmp"
+        fi
+        
+        # Generate PKCS#12 for client certificates
+        if [ "$cert_type" = "client" ]; then
+            generate_pkcs12 "$cert_uid" "$cert_cn"
+        fi
+        
+        # Display information
+        if [ "$cert_type" = "server" ]; then
+            display_server_cert_info "$cert_uid" "$cert_cn" "$project_dir"
+        else
+            display_client_cert_info "$cert_uid" "$cert_cn" "$project_dir"
+        fi
+    else
+        echo "$(tput bold)The CSR file has been generated for ${cert_type} identified as '${cert_cn}'"
+        echo "  pubreq.csr : ${project_dir}/${cert_uid}.csr"
+        echo "You can now send it to your *trusted CA* (required for them to generate your signed certificate in return)$(tput sgr0)"
+    fi
+    
+    # Set file permissions
+    umask 022
+    chmod 600 "${project_dir}/ca.srl" 2>/dev/null || true
+    chmod 444 "${project_dir}/${cert_uid}.csr" "${project_dir}/${cert_uid}.crt" 2>/dev/null || true
+}
+
+# Run main function
+main "$@"

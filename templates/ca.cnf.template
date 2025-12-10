@@ -1,0 +1,43 @@
+[ ca ]
+default_ca = CA_default
+
+[ CA_default ]
+dir = __CA_DIR__
+certs = $dir
+new_certs_dir = $dir/newcerts
+private_key = $dir/ca.key
+certificate = $dir/ca.crt
+serial = $dir/ca.srl
+database = $dir/index.txt
+unique_subject = no
+default_md = sha512
+preserve = no
+policy = policy_match
+default_days = __CA_EXPIRE_DAYS__
+x509_extensions = v3_ca
+crlnumber = $dir/crlnumber
+crl_dir = $dir/crl
+default_crl_days = __CRL_EXPIRE_DAYS__
+
+[ policy_match ]
+countryName = match
+stateOrProvinceName = optional
+organizationName = match
+organizationalUnitName = optional
+commonName = supplied
+emailAddress = optional
+
+[ v3_ca ]
+subjectKeyIdentifier = hash
+authorityKeyIdentifier = keyid:always,issuer:always
+basicConstraints = critical,CA:true
+keyUsage = critical, keyCertSign, cRLSign
+crlDistributionPoints = URI:file://__CA_DIR__/crl/ca.crl
+
+[ v3_req ]
+basicConstraints = CA:FALSE
+keyUsage = nonRepudiation, digitalSignature, keyEncipherment
+
+[ crl_ext ]
+authorityKeyIdentifier = keyid:always,issuer:always
+

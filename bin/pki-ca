@@ -1,0 +1,376 @@
+#!/bin/bash
+#
+# PKI Manager - Certificate Authority Management
+# Creates and manages Certificate Authorities (CA)
+#
+# Usage: pki-ca create -p <project_name> -a <algorithm>
+#   pki-ca create: Create a new CA
+#   -p: Project name (required)
+#   -a: Algorithm - 'rsa' or 'ec' (required)
+#
+# Environment variables:
+#   CA_C, CA_L, CA_O, CA_OU, CA_CN: Certificate subject fields
+#   CA_EXPIRE_DAYS: CA validity period (default: 365)
+#   CRL_EXPIRE_DAYS: CRL validity period (default: 30)
+
+set -uo pipefail
+
+# Get script directory and source common library
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+PROJECT_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
+source "${PROJECT_ROOT}/lib/common.sh"
+
+# Get script directory to find template
+get_template_path() {
+    find_template "ca.cnf.template"
+}
+
+# Display usage
+usage() {
+    cat >&2 <<EOF
+Usage: $0 create -p <project_name> -a <algorithm>
+
+Commands:
+  create    Create a new Certificate Authority
+
+Options:
+  -p <project_name>  Project name (required)
+  -a <algorithm>      Encryption algorithm: 'rsa' or 'ec' (required)
+  -h                 Show this help message
+
+Environment variables:
+  CA_C              Country code (default: FR)
+  CA_L              Locality (default: Paris)
+  CA_O              Organization (default: France)
+  CA_OU             Organizational Unit (default: DevOps)
+  CA_CN             Common Name (default: project name)
+  CA_EXPIRE_DAYS    CA validity period in days (default: 365)
+  CRL_EXPIRE_DAYS   CRL validity period in days (default: 30)
+
+Examples:
+  $0 create -p myproject -a ec
+  $0 create -p production -a rsa
+
+EOF
+    exit 1
+}
+
+# Parse command line arguments
+parse_args() {
+    local command=""
+    local project_name=""
+    local algo_key=""
+    
+    if [ $# -eq 0 ]; then
+        usage
+    fi
+    
+    case "$1" in
+        create)
+            command="create"
+            shift
+            ;;
+        -h|--help|help)
+            usage
+            ;;
+        *)
+            error_exit "Unknown command: $1. Use 'create' or 'help'"
+            ;;
+    esac
+    
+    while getopts p:a:h opt; do
+        case "$opt" in
+            p)
+                project_name="$OPTARG"
+                ;;
+            a)
+                case "$OPTARG" in
+                    rsa|ec)
+                        algo_key="$OPTARG"
+                        ;;
+                    *)
+                        error_exit "Invalid algorithm '$OPTARG'. Must be 'rsa' or 'ec'"
+                        ;;
+                esac
+                ;;
+            h)
+                usage
+                ;;
+            *)
+                usage
+                ;;
+        esac
+    done
+    
+    if [ "$command" = "create" ]; then
+        if [ -z "$project_name" ] || [ -z "$algo_key" ]; then
+            usage
+        fi
+    fi
+    
+    echo "${command}|${project_name}|${algo_key}"
+}
+
+# Create CA configuration file
+create_ca_config() {
+    local ca_dir="$1"
+    local expire_days="${CA_EXPIRE_DAYS:-365}"
+    local crl_expire_days="${CRL_EXPIRE_DAYS:-30}"
+    
+    local template_file
+    template_file=$(get_template_path) || {
+        error_exit "Template file not found: templates/ca.cnf.template
+
+Please ensure the template exists in the templates/ directory."
+    }
+    
+    # Replace placeholders in template
+    if ! sed -e "s|__CA_DIR__|${ca_dir}|g" \
+             -e "s|__CA_EXPIRE_DAYS__|${expire_days}|g" \
+             -e "s|__CRL_EXPIRE_DAYS__|${crl_expire_days}|g" \
+             "$template_file" > "${ca_dir}/ca.cnf"; then
+        error_exit "Failed to process template file: $template_file"
+    fi
+    
+    # Verify config file was created
+    if [ ! -f "${ca_dir}/ca.cnf" ]; then
+        error_exit "Failed to create CA configuration file: ${ca_dir}/ca.cnf"
+    fi
+}
+
+# Generate CA key and certificate
+generate_ca_certificate() {
+    local ca_dir="$1"
+    local algo="$2"
+    local subject="$3"
+    local expire_days="${CA_EXPIRE_DAYS:-365}"
+    local pass_file="${ca_dir}/ca.pass"
+    
+    # Verify password file exists
+    if [ ! -f "$pass_file" ]; then
+        error_exit "Password file not found: $pass_file"
+    fi
+    
+    # Verify config file exists
+    if [ ! -f "${ca_dir}/ca.cnf" ]; then
+        error_exit "Configuration file not found: ${ca_dir}/ca.cnf"
+    fi
+    
+    # Change to CA directory for relative paths
+    cd "$ca_dir" || error_exit "Cannot change to directory: $ca_dir"
+    
+    if [ "$algo" = "ec" ]; then
+        # Generate EC parameters first, then create key and certificate
+        # Create temp file in current directory to avoid permission issues
+        local ec_param_file="ec_param_$$.pem"
+        
+        info "Generating EC parameters..."
+        if ! openssl ecparam -name secp384r1 -out "$ec_param_file" 2>&1; then
+            rm -f "$ec_param_file"
+            error_exit "Failed to generate EC parameters"
+        fi
+        
+        info "Generating CA key and certificate..."
+        local openssl_output
+        openssl_output=$(openssl req \
+            -new -x509 -days "$expire_days" \
+            -newkey ec:"$ec_param_file" \
+            -keyout "ca.key" \
+            -passout "file:ca.pass" \
+            -utf8 -nameopt multiline,utf8 \
+            -config "ca.cnf" \
+            -extensions v3_ca \
+            -out "ca.crt" \
+            -subj "$subject" 2>&1)
+        local openssl_status=$?
+        
+        # Clean up temp file
+        rm -f "$ec_param_file"
+        
+        if [ $openssl_status -ne 0 ]; then
+            error_exit "Failed to generate CA certificate:
+
+$openssl_output
+
+Please check:
+- ca.cnf exists and is valid
+- ca.pass exists and is readable
+- You have write permissions in $ca_dir"
+        fi
+    elif [ "$algo" = "rsa" ]; then
+        info "Generating CA key and certificate..."
+        local openssl_output
+        openssl_output=$(openssl req \
+            -new -x509 -days "$expire_days" \
+            -newkey rsa:4096 \
+            -keyout "ca.key" \
+            -passout "file:ca.pass" \
+            -utf8 -nameopt multiline,utf8 \
+            -config "ca.cnf" \
+            -extensions v3_ca \
+            -out "ca.crt" \
+            -subj "$subject" 2>&1)
+        local openssl_status=$?
+        
+        if [ $openssl_status -ne 0 ]; then
+            error_exit "Failed to generate CA certificate:
+
+$openssl_output
+
+Please check:
+- ca.cnf exists and is valid
+- ca.pass exists and is readable
+- You have write permissions in $ca_dir"
+        fi
+    else
+        error_exit "Unsupported algorithm: $algo"
+    fi
+    
+    # Verify files were created
+    if [ ! -f "ca.key" ]; then
+        error_exit "CA key file was not created: ca.key"
+    fi
+    
+    if [ ! -f "ca.crt" ]; then
+        error_exit "CA certificate file was not created: ca.crt"
+    fi
+}
+
+# Initialize CA directory structure
+initialize_ca_directory() {
+    local ca_dir="$1"
+    
+    # Create directories
+    mkdir -p "${ca_dir}/crl" "${ca_dir}/newcerts" "${ca_dir}/private"
+    chmod 700 "${ca_dir}/private"
+    
+    # Initialize files
+    touch "${ca_dir}/index.txt"
+    echo "01" > "${ca_dir}/crlnumber"
+    echo "unique_subject = no" >> "${ca_dir}/index.txt.attr"
+    echo "01" > "${ca_dir}/ca.srl"
+}
+
+# Generate initial CRL
+generate_initial_crl() {
+    local ca_dir="$1"
+    
+    # Change to CA directory for relative paths
+    cd "$ca_dir" || error_exit "Cannot change to directory: $ca_dir"
+    
+    if ! openssl ca -gencrl \
+        -config "ca.cnf" \
+        -keyfile "ca.key" \
+        -cert "ca.crt" \
+        -passin "file:ca.pass" \
+        -out "crl/ca.crl"; then
+        error_exit "Failed to generate initial CRL"
+    fi
+    
+    chmod 444 "crl/ca.crl"
+}
+
+# Main function
+main() {
+    local command project_name algo_key
+    local result
+    
+    # Set locale
+    export LC_CTYPE=C
+    
+    # Check dependencies
+    check_dependencies
+    
+    # Parse arguments
+    result=$(parse_args "$@")
+    command=$(echo "$result" | cut -d'|' -f1)
+    project_name=$(echo "$result" | cut -d'|' -f2)
+    algo_key=$(echo "$result" | cut -d'|' -f3)
+    
+    if [ "$command" = "create" ]; then
+        # Validate project name
+        if [ -d "$project_name" ]; then
+            error_exit "Project directory '$project_name' already exists"
+        fi
+        
+        # Create project directory
+        mkdir -p "$project_name"
+        local ca_dir
+        ca_dir=$(cd "$project_name" && pwd)
+        
+        # Set secure umask for password file
+        umask 377
+        
+        # Generate CA password
+        info "Generating CA password..."
+        local password_output
+        password_output=$(generate_password 65 2>&1)
+        local password_status=$?
+        
+        if [ $password_status -ne 0 ] || [ -z "$password_output" ]; then
+            error_exit "Failed to generate CA password. Error: $password_output"
+        fi
+        
+        # Write password to file
+        echo -n "$password_output" > "${ca_dir}/ca.pass" || {
+            error_exit "Failed to write password file: ${ca_dir}/ca.pass"
+        }
+        
+        if [ ! -f "${ca_dir}/ca.pass" ] || [ ! -s "${ca_dir}/ca.pass" ]; then
+            error_exit "Password file was not created or is empty: ${ca_dir}/ca.pass"
+        fi
+        
+        # Initialize directory structure
+        info "Initializing CA directory structure..."
+        if ! initialize_ca_directory "$ca_dir"; then
+            error_exit "Failed to initialize CA directory structure"
+        fi
+        
+        # Create CA configuration
+        info "Creating CA configuration file..."
+        if ! create_ca_config "$ca_dir"; then
+            error_exit "Failed to create CA configuration"
+        fi
+        
+        # Build certificate subject
+        local subject="/C=${CA_C:-FR}/L=${CA_L:-Paris}/O=${CA_O:-France}/OU=${CA_OU:-DevOps}/CN=${CA_CN:-$project_name}"
+        
+        # Generate CA key and certificate
+        generate_ca_certificate "$ca_dir" "$algo_key" "$subject"
+        
+        # Return to original directory
+        cd "$PROJECT_ROOT" || true
+        
+        # Set file permissions
+        umask 022
+        chmod 400 "${ca_dir}/ca.key"
+        chmod 444 "${ca_dir}/ca.crt"
+        
+        # Generate initial CRL
+        generate_initial_crl "$ca_dir"
+        
+        # Return to original directory
+        cd "$PROJECT_ROOT" || true
+        
+        # Display success message
+        echo
+        success "The Certificate Authority files have been generated:"
+        echo " - key:         '${ca_dir}/ca.key'"
+        echo " - certificate: '${ca_dir}/ca.crt' (self-signed)"
+        echo " - config:      '${ca_dir}/ca.cnf'"
+        echo " - CRL:         '${ca_dir}/crl/ca.crl'"
+        echo
+        echo "Show Certificate details via:"
+        echo "    openssl x509 -nameopt multiline,-esc_msb,utf8 -in ${ca_dir}/ca.crt -text -noout | egrep -i -v '^\s+([0-9a-z]{2}:){15,}'"
+        echo
+        echo "Show CRL details via:"
+        echo "    openssl crl -in ${ca_dir}/crl/ca.crl -text -noout"
+        echo
+    else
+        usage
+    fi
+}
+
+# Run main function
+main "$@"
+
